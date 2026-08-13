@@ -1,0 +1,12 @@
+{
+  "name": "codextras",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Custom dependency-free Codex router with compaction, subagent, tool call, advertised vision, and preserved reasoning support",
+  "scripts": {
+    "start": "bun run src/server.mjs",
+    "test": "bun test",
+    "smoke": "bun run smoke/smoke.mjs"
+  }
+}
