@@ -1,20 +1,22 @@
 # AGENTS.md
 
 Pure-Bun Codex gateway: ChatCompletions <-> Responses for the Codex desktop/CLI
-app, zero npm dependencies, no build step. Declared models route to
-OpenAI-compatible chat providers; undeclared models pass through to the
-signed-in ChatGPT backend.
+app, zero npm dependencies. Declared models route to OpenAI-compatible chat
+providers; undeclared models pass through to the signed-in ChatGPT backend.
+Distributed as a compiled binary (`bun run build` -> `codextras`); run it
+wherever you install it and state/, logs/, codextras.json resolve next to it.
 
 ## Commands
 
-    bin/codextras start|stop|status     daemonize via nohup + pidfile
-    bin/codextras catalog               declared-models catalog
-    bin/codextras catalog-merged        capture native catalog + write state/merged-models.json
-    bin/codextras dry-run [alias]       render future config.toml without writing
-    bin/codextras apply [alias]         backup + switch ~/.codex/config.toml to codextras
-    bin/codextras restore               restore the pre-codextras config.toml
-    bun test                            unit tests (stop the gateway first: port conflict)
-    ./smoke/verify-after-switch.sh      live checks (needs gateway running + real upstream key)
+    codextras start|stop|status       daemonize via pidfile
+    codextras catalog                 declared-models catalog
+    codextras catalog-merged          capture native catalog + write state/merged-models.json
+    codextras dry-run [alias]         render future config.toml without writing
+    codextras apply [alias]           backup + switch ~/.codex/config.toml to codextras
+    codextras restore                 restore the pre-codextras config.toml
+    bun run build                     compile the binary (src/cli.mjs)
+    bun test                          unit tests (stop the gateway first: port conflict)
+    ./smoke/verify-after-switch.sh    live checks (needs gateway running + real upstream key)
 
 ## Architecture
 
@@ -70,7 +72,7 @@ Example (opencode-go provider + DeepSeek V4 Flash):
 }
 ```
 
-Then `bin/codextras apply <alias>` and restart the Codex app (it caches the
+Then `codextras apply <alias>` and restart the Codex app (it caches the
 catalog). `catalogOverrides` can force native-model visibility (e.g.
 `{"gpt-5.2": {"visibility": "hide"}}`).
 
@@ -97,10 +99,10 @@ catalog). `catalogOverrides` can force native-model visibility (e.g.
 
 ## Verification loop
 
-1. `bin/codextras stop && bun test && bin/codextras start`
+1. `codextras stop && bun test && codextras start`
 2. `./smoke/verify-after-switch.sh` (health, config.toml root keys, catalog,
    real upstream turn, compaction, WS 426)
-3. `bin/codextras apply <alias>`, then the Codex app must be fully quit and
+3. `codextras apply <alias>`, then the Codex app must be fully quit and
    reopened to reload the catalog.
 
 ## Conventions
