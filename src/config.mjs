@@ -1,7 +1,18 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-export const ROOT = path.resolve(import.meta.dir, "..");
+// In a compiled binary, import.meta.dir is a baked-in build-time path that
+// does not exist at runtime; the codextras root is then the binary's own
+// directory, so state/, logs/, codextras.json and relative apiKeyFile paths
+// resolve next to the executable no matter where it is installed.
+export function isCompiledBinary() {
+  const execBase = path.basename(process.execPath || "");
+  return execBase !== "bun" && execBase !== "bun.exe" && !/^bun[.-]/.test(execBase);
+}
+
+export const ROOT = path.resolve(
+  isCompiledBinary() ? path.dirname(process.execPath) : path.join(import.meta.dir, ".."),
+);
 export const CONFIG_PATH =
   process.env.CODEXTRAS_CONFIG || path.join(ROOT, "codextras.json");
 export const STATE_DIR = path.join(ROOT, "state");
@@ -20,7 +31,17 @@ export function loadConfig() {
   const pathPrefix = String(gateway.pathPrefix || "/_codextras").replace(/\/$/, "");
   return {
     gateway: { port, pathPrefix },
-    providers: Array.isArray(raw.providers) ? raw.providers : [],
+    providers: (Array.isArray(raw.providers) ? raw.providers : []).map((provider) => ({
+      ...provider,
+      // Relative apiKeyFile paths are resolved against the codextras root so
+      // they work regardless of the gateway's working directory.
+      apiKeyFile:
+        provider &&
+        typeof provider.apiKeyFile === "string" &&
+        !path.isAbsolute(provider.apiKeyFile)
+          ? path.resolve(ROOT, provider.apiKeyFile)
+          : provider && provider.apiKeyFile,
+    })),
     models: Array.isArray(raw.models) ? raw.models : [],
     catalogOverrides:
       raw.catalogOverrides && typeof raw.catalogOverrides === "object"
