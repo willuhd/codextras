@@ -9,8 +9,9 @@ import {
   responsesUrl,
 } from "./adapter.mjs";
 import { buildMessages, flattenTools, flattenToolsForResponses } from "./convert/request.mjs";
-import { ChatStreamConverter } from "./convert/stream.mjs";
+import { ChatStreamConverter, mapToolName } from "./convert/stream.mjs";
 import { convertChatJsonToResponses } from "./convert/json.mjs";
+import { toolCallItem, unwrapCustomToolArguments } from "./convert/tools.mjs";
 import {
   compactOutputV1,
   compactionSnapshot,
@@ -118,6 +119,168 @@ async function streamTurn(upstream, { model, requestBytes, toolNames, customName
         // Upstream aborted mid-stream; finalize what we have instead of hanging.
       }
       controller.enqueue(encoder.encode(converter.finish()));
+      controller.enqueue(encoder.encode(sseDone()));
+      controller.close();
+    },
+  });
+  return new Response(stream, { headers: SSE_HEADERS });
+}
+
+function mapResponsesItemForCodex(item, toolNames, customNames) {
+  if (!item || typeof item !== "object") return item;
+  const t = item.type;
+  if (t !== "function_call" && t !== "custom_tool_call") return item;
+  let name = item.name;
+  let callId = item.call_id || item.id;
+  let args = typeof item.arguments === "string" ? item.arguments : typeof item.input === "string" ? item.input : "";
+  // If upstream returned flat name (collaboration__spawn_agent), map to namespaced for Codex
+  const mapped = toolNames instanceof Map ? toolNames.get(name) : undefined;
+  const fallback = !mapped ? mapToolName(name) : undefined;
+  const target = mapped || fallback;
+  if (target) {
+    name = target.name;
+    item = { ...item, name, namespace: target.namespace };
+  }
+  // Custom tools: Codex expects custom_tool_call with raw input, not function_call with JSON
+  const isCustom = customNames instanceof Set && customNames.has(name);
+  if (isCustom) {
+    const raw = item.type === "custom_tool_call" ? item.input : unwrapCustomToolArguments(args);
+    return {
+      id: callId,
+      type: "custom_tool_call",
+      status: item.status || "completed",
+      call_id: callId,
+      name,
+      input: raw,
+    };
+  }
+  if (t === "custom_tool_call" && !isCustom) {
+    // Upstream mistakenly returned custom for a non-custom tool — normalize to function_call
+    return {
+      id: callId,
+      type: "function_call",
+      status: item.status || "completed",
+      call_id: callId,
+      name,
+      arguments: typeof item.input === "string" ? item.input : args,
+      ...(item.namespace ? { namespace: item.namespace } : target ? { namespace: target.namespace } : {}),
+    };
+  }
+  // Ensure function_call has arguments string
+  if (isCustom) return item;
+  return {
+    ...item,
+    name,
+    arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}),
+    ...(target && !item.namespace ? { namespace: target.namespace } : {}),
+  };
+}
+
+function transformResponsesJsonForCodex(json, { toolNames, customNames, requestedModel, requestBytes }) {
+  if (!json || typeof json !== "object") return json;
+  json.model = requestedModel;
+  if (Array.isArray(json.output)) {
+    json.output = json.output.map((item) => {
+      if (!item || typeof item !== "object") return item;
+      if (item.type === "function_call" || item.type === "custom_tool_call") {
+        return mapResponsesItemForCodex(item, toolNames, customNames);
+      }
+      // Some providers nest tool calls inside message content? Not for Responses.
+      return item;
+    });
+  }
+  if (!json.usage) {
+    // Lazy fallback — caller will finalize if needed; keep shape for finalizeUsage
+    json.usage = null;
+  }
+  return json;
+}
+
+async function streamResponsesTurn(upstream, { model, requestBytes, toolNames, customNames }) {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  // We need to rewrite tool names on the fly while proxying raw SSE.
+  // Responses SSE is `event: <type>\ndata: <json>\n\n` — we parse each block, map tool items, re-emit.
+  const reader = upstream.body.getReader();
+  let buffer = "";
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            if (!block.trim()) continue;
+            const lines = block.split("\n");
+            let event = "";
+            let data = "";
+            for (const line of lines) {
+              if (line.startsWith("event:")) event = line.slice(6).trim();
+              else if (line.startsWith("data:")) data = line.slice(5).trimStart();
+            }
+            if (!data || data === "[DONE]") {
+              if (data === "[DONE]") controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              continue;
+            }
+            let parsed;
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              controller.enqueue(encoder.encode(`event: ${event || "message"}\ndata: ${data}\n\n`));
+              continue;
+            }
+            // Map tool call items in output_item events
+            if (
+              (event === "response.output_item.added" || event === "response.output_item.done") &&
+              parsed.item &&
+              (parsed.item.type === "function_call" || parsed.item.type === "custom_tool_call")
+            ) {
+              parsed.item = mapResponsesItemForCodex(parsed.item, toolNames, customNames);
+              if (parsed.item.type === "function_call" && parsed.item.namespace) {
+                // Codex expects namespaced function_call to carry namespace alongside name
+                parsed.item.namespace = parsed.item.namespace;
+              }
+            }
+            // Also handle response.completed's output array (some providers send it as event data)
+            if (event === "response.completed" && parsed.response && Array.isArray(parsed.response.output)) {
+              parsed.response.output = parsed.response.output.map((it) => mapResponsesItemForCodex(it, toolNames, customNames));
+              parsed.response.model = model;
+            }
+            // Rewrite model in response.created/in_progress if present
+            if ((event === "response.created" || event === "response.in_progress") && parsed.response) {
+              parsed.response.model = model;
+            }
+            const outData = JSON.stringify(parsed);
+            if (event) controller.enqueue(encoder.encode(`event: ${event}\ndata: ${outData}\n\n`));
+            else controller.enqueue(encoder.encode(`data: ${outData}\n\n`));
+          }
+        }
+        // Flush remainder
+        if (buffer.trim()) {
+          const lines = buffer.split("\n");
+          let event = "";
+          let data = "";
+          for (const line of lines) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data = line.slice(5).trimStart();
+          }
+          if (data && data !== "[DONE]") {
+            try {
+              let parsed = JSON.parse(data);
+              if (parsed.item) parsed.item = mapResponsesItemForCodex(parsed.item, toolNames, customNames);
+              controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(parsed)}\n\n`));
+            } catch {
+              controller.enqueue(encoder.encode(buffer));
+            }
+          }
+        }
+      } catch {
+        // Upstream aborted — close gracefully
+      }
       controller.enqueue(encoder.encode(sseDone()));
       controller.close();
     },
@@ -243,22 +406,25 @@ async function handleTurn(request, payload, apiPath, rawBody) {
       return json({ error: { message } }, res.status);
     }
     if (stream) {
-      // Responses upstream already speaks SSE in Codex format — proxy verbatim.
-      // Rewrite Content-Type to event-stream if upstream omits it.
-      const headersOut = new Headers(res.headers);
-      if (!headersOut.get("content-type")) headersOut.set("content-type", "text/event-stream; charset=utf-8");
-      return new Response(res.body, { status: res.status, headers: headersOut });
+      return streamResponsesTurn(res, {
+        model: model.alias,
+        requestBytes,
+        toolNames: names,
+        customNames,
+      });
     }
     const upstreamJson = await res.json().catch(() => ({}));
-    // Keep Codex's alias as model; fix usage shape if upstream omits it.
-    if (upstreamJson && typeof upstreamJson === "object") {
-      upstreamJson.model = model.alias;
-      if (!upstreamJson.usage) {
-        const { fallbackFrom, finalizeUsage } = await import("./usage.mjs");
-        upstreamJson.usage = finalizeUsage(undefined, fallbackFrom(requestBytes, JSON.stringify(upstreamJson.output || "")));
-      }
+    const mapped = transformResponsesJsonForCodex(upstreamJson, {
+      toolNames: names,
+      customNames,
+      requestedModel: model.alias,
+      requestBytes,
+    });
+    if (mapped && typeof mapped === "object" && !mapped.usage) {
+      const { fallbackFrom, finalizeUsage } = await import("./usage.mjs");
+      mapped.usage = finalizeUsage(undefined, fallbackFrom(requestBytes, JSON.stringify(mapped.output || "")));
     }
-    return json(upstreamJson);
+    return json(mapped);
   }
   const { tools, names, customNames } = flattenTools(payload.tools);
   const messages = buildMessages({ input: payload.input || [], model });
