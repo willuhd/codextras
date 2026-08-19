@@ -114,6 +114,26 @@ export function flattenTools(tools) {
   return { tools: flat, names, customNames: extractCustomToolNames(tools) };
 }
 
+// Responses API shape is flat: {type:"function", name, description, parameters}
+// rather than chat's {type:"function", function:{name,…}}. Namespace tools are
+// still flattened to collaboration__spawn_agent etc., and custom tools keep the
+// single required `content` schema so the custom_tool_call bridge stays shared.
+export function flattenToolsForResponses(tools) {
+  const { tools: chatTools, names, customNames } = flattenTools(tools);
+  const flat = chatTools.map((t) => {
+    if (t && t.type === "function" && t.function && typeof t.function.name === "string") {
+      return {
+        type: "function",
+        name: t.function.name,
+        description: t.function.description || "",
+        parameters: t.function.parameters || { type: "object", properties: {} },
+      };
+    }
+    return t;
+  });
+  return { tools: flat, names, customNames };
+}
+
 function modelSupportsImages(model) {
   return Array.isArray(model.inputModalities) && model.inputModalities.includes("image");
 }
@@ -206,6 +226,21 @@ function agentMessageText(item) {
   return parts.join("\n");
 }
 
+// Toggle for the <thought> hack: DeepSeek needs visible thought blocks
+// because its API discards reasoning_content from usable context; Responses
+// models (Muse Spark) carry encrypted reasoning natively via include+store,
+// so the visible hack can be disabled per-model with reasoningInjection:"none"
+// or disableThoughtHack:true.
+function shouldUseThoughtHack(model) {
+  if (!model || typeof model !== "object") return true;
+  if (model.reasoningInjection === false) return false;
+  if (model.reasoningInjection === "none") return false;
+  if (model.reasoningInjection === "encrypted") return false;
+  if (model.disableThoughtHack === true) return false;
+  if (model.thinkingHack === false) return false;
+  return true;
+}
+
 // Reasoning that immediately precedes a tool call (or an empty assistant
 // message announcing one) is carried as visible assistant text so the tool-call
 // turn keeps a thinking thread the model can actually read. All reasoning is
@@ -230,6 +265,7 @@ export function buildMessages({ input, model }) {
   const items = Array.isArray(input) ? input : [];
   let pendingReasoning = "";
   let pendingVisible = "";
+  const useThoughtHack = shouldUseThoughtHack(model);
 
   function attachReasoning(message) {
     if (!pendingReasoning) return;
@@ -247,6 +283,10 @@ export function buildMessages({ input, model }) {
   // assistant content into the discarded reasoning channel.
   function flushVisible() {
     if (!pendingVisible) return;
+    if (!useThoughtHack) {
+      pendingVisible = "";
+      return;
+    }
     messages.push({
       role: "assistant",
       content: [{ type: "text", text: "<thought>\n" + pendingVisible + "\n</thought>" }],
@@ -304,11 +344,17 @@ export function buildMessages({ input, model }) {
       pendingReasoning = pendingReasoning ? pendingReasoning + "\n\n" + text : text;
       if (shouldCarryReasoning(item, items[i + 1])) {
         flushVisible();
-        const carried = {
-          role: "assistant",
-          reasoning_content: pendingReasoning,
-          content: [{ type: "text", text: "<thought>\n" + pendingReasoning + "\n</thought>" }],
-        };
+        const carried = useThoughtHack
+          ? {
+              role: "assistant",
+              reasoning_content: pendingReasoning,
+              content: [{ type: "text", text: "<thought>\n" + pendingReasoning + "\n</thought>" }],
+            }
+          : {
+              role: "assistant",
+              reasoning_content: pendingReasoning,
+              content: null,
+            };
         pendingReasoning = "";
         messages.push(carried);
       } else {

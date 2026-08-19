@@ -1,7 +1,14 @@
 import { loadConfig, loadSecret, findModel, providerFor } from "./config.mjs";
 import { generateCatalog } from "./catalog.mjs";
-import { buildChatBody, chatUrl, providerHeaders } from "./adapter.mjs";
-import { buildMessages, flattenTools } from "./convert/request.mjs";
+import {
+  buildChatBody,
+  buildResponsesBody,
+  chatUrl,
+  isResponsesModel,
+  providerHeaders,
+  responsesUrl,
+} from "./adapter.mjs";
+import { buildMessages, flattenTools, flattenToolsForResponses } from "./convert/request.mjs";
 import { ChatStreamConverter } from "./convert/stream.mjs";
 import { convertChatJsonToResponses } from "./convert/json.mjs";
 import {
@@ -200,6 +207,58 @@ async function handleTurn(request, payload, apiPath, rawBody) {
   const provider = providerFor(model, config);
   if (!provider) {
     return json({ error: { message: "No provider configured for " + model.alias } }, 500);
+  }
+  const isResponses = isResponsesModel(model, provider);
+  if (isResponses) {
+    const { tools, names, customNames } = flattenToolsForResponses(payload.tools);
+    const input = Array.isArray(payload.input) ? payload.input : [];
+    const stream = payload.stream !== false;
+    const body = buildResponsesBody({ payload, model, provider, input, tools, stream });
+    const requestBytes = Buffer.byteLength(JSON.stringify(body), "utf8");
+    const url = responsesUrl(provider);
+    const headers = providerHeaders(provider);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: request.signal,
+      });
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      return json({ error: { message } }, 502);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      let message = "Upstream error " + res.status;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && parsed.error && parsed.error.message) message = parsed.error.message;
+        else if (parsed && parsed.error) message = JSON.stringify(parsed.error);
+        else if (text) message = text.slice(0, 500);
+      } catch {
+        if (text) message = text.slice(0, 500);
+      }
+      return json({ error: { message } }, res.status);
+    }
+    if (stream) {
+      // Responses upstream already speaks SSE in Codex format — proxy verbatim.
+      // Rewrite Content-Type to event-stream if upstream omits it.
+      const headersOut = new Headers(res.headers);
+      if (!headersOut.get("content-type")) headersOut.set("content-type", "text/event-stream; charset=utf-8");
+      return new Response(res.body, { status: res.status, headers: headersOut });
+    }
+    const upstreamJson = await res.json().catch(() => ({}));
+    // Keep Codex's alias as model; fix usage shape if upstream omits it.
+    if (upstreamJson && typeof upstreamJson === "object") {
+      upstreamJson.model = model.alias;
+      if (!upstreamJson.usage) {
+        const { fallbackFrom, finalizeUsage } = await import("./usage.mjs");
+        upstreamJson.usage = finalizeUsage(undefined, fallbackFrom(requestBytes, JSON.stringify(upstreamJson.output || "")));
+      }
+    }
+    return json(upstreamJson);
   }
   const { tools, names, customNames } = flattenTools(payload.tools);
   const messages = buildMessages({ input: payload.input || [], model });

@@ -8,7 +8,14 @@ import {
   sseDone,
 } from "./util.mjs";
 import { buildMessages, userMessageTexts } from "./convert/request.mjs";
-import { buildChatBody, chatUrl, providerHeaders } from "./adapter.mjs";
+import {
+  buildChatBody,
+  buildResponsesBody,
+  chatUrl,
+  isResponsesModel,
+  providerHeaders,
+  responsesUrl,
+} from "./adapter.mjs";
 import { fallbackFrom, finalizeUsage } from "./usage.mjs";
 
 function extractResponseText(json) {
@@ -27,12 +34,23 @@ function extractResponseText(json) {
 }
 
 export async function summarize({ payload, model, provider, requestBytes, signal }) {
-  const messages = buildMessages({ input: payload.input || [], model });
-  messages.push({ role: "user", content: [{ type: "text", text: COMPACT_PROMPT }] });
-  const body = buildChatBody({ payload, model, provider, messages, tools: [], stream: false });
+  const isResponses = isResponsesModel(model, provider);
+  let body;
+  let url;
+  if (isResponses) {
+    const input = Array.isArray(payload.input) ? [...payload.input] : [];
+    input.push({ type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_PROMPT }] });
+    body = buildResponsesBody({ payload, model, provider, input, tools: [], stream: false });
+    url = responsesUrl(provider);
+  } else {
+    const messages = buildMessages({ input: payload.input || [], model });
+    messages.push({ role: "user", content: [{ type: "text", text: COMPACT_PROMPT }] });
+    body = buildChatBody({ payload, model, provider, messages, tools: [], stream: false });
+    url = chatUrl(provider);
+  }
   let res;
   try {
-    res = await fetch(chatUrl(provider), {
+    res = await fetch(url, {
       method: "POST",
       headers: providerHeaders(provider),
       body: JSON.stringify(body),
