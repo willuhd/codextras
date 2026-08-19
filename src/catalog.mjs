@@ -21,6 +21,11 @@ export function modelToCatalogEntry(model) {
   const efforts = Array.isArray(model.efforts) && model.efforts.length ? model.efforts : ["low", "high", "max"];
   const defaultEffort = model.defaultEffort || efforts[efforts.length - 1] || "high";
   const instructions = instructionsTemplate(model);
+  const reasoningSummary = typeof model.reasoningSummary === "string" ? model.reasoningSummary : "none";
+  const supportsSummaries =
+    typeof model.supportsReasoningSummaries === "boolean"
+      ? model.supportsReasoningSummaries
+      : reasoningSummary !== "none";
   return {
     slug: model.alias,
     display_name: model.displayName || model.alias,
@@ -47,8 +52,8 @@ export function modelToCatalogEntry(model) {
     include_apps_usage_instructions: true,
     support_verbosity: false,
     default_verbosity: null,
-    default_reasoning_summary: "none",
-    supports_reasoning_summaries: false,
+    default_reasoning_summary: reasoningSummary,
+    supports_reasoning_summaries: supportsSummaries,
     supports_search_tool: false,
     experimental_supported_tools: [],
     additional_speed_tiers: [],
