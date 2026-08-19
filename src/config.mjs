@@ -27,7 +27,7 @@ function loadJson(file) {
 export function loadConfig() {
   const raw = loadJson(CONFIG_PATH);
   const gateway = raw.gateway || {};
-  const port = Number(gateway.port || 4200);
+  const port = Number(gateway.port ?? 4200);
   const pathPrefix = String(gateway.pathPrefix || "/_codextras").replace(/\/$/, "");
   return {
     gateway: { port, pathPrefix },

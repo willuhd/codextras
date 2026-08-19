@@ -36,7 +36,7 @@ export function buildChatBody({ payload, model, provider, messages, tools, strea
   };
   if (tools && tools.length) {
     body.tools = tools;
-    body.tool_choice = "auto";
+    body.tool_choice = payload.tool_choice ?? "auto";
   }
   const requested = payload.reasoning && payload.reasoning.effort;
   const effort = effortFor(model, requested);
@@ -91,6 +91,17 @@ export function responsesUrl(provider) {
   return String(provider.baseUrl).replace(/\/$/, "") + "/responses";
 }
 
+export function supportsResponsesCustomTools(model, provider) {
+  for (const value of [
+    model && model.supportsCustomTools,
+    provider && provider.supportsCustomTools,
+    provider && provider.quirks && provider.quirks.supportsCustomTools,
+  ]) {
+    if (typeof value === "boolean") return value;
+  }
+  return true;
+}
+
 export function buildResponsesBody({ payload, model, provider, input, tools, stream }) {
   const quirks = provider.quirks || {};
   const body = {
@@ -103,7 +114,7 @@ export function buildResponsesBody({ payload, model, provider, input, tools, str
   }
   if (tools && tools.length) {
     body.tools = tools;
-    body.tool_choice = "auto";
+    body.tool_choice = payload.tool_choice ?? "auto";
   }
   const requested = payload.reasoning && payload.reasoning.effort;
   const effort = effortFor(model, requested);

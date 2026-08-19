@@ -15,6 +15,7 @@ import {
   isResponsesModel,
   providerHeaders,
   responsesUrl,
+  supportsResponsesCustomTools,
 } from "./adapter.mjs";
 import { fallbackFrom, finalizeUsage } from "./usage.mjs";
 
@@ -38,7 +39,11 @@ export async function summarize({ payload, model, provider, requestBytes, signal
   let body;
   let url;
   if (isResponses) {
-    const base = buildResponsesInput({ input: Array.isArray(payload.input) ? payload.input : [], model });
+    const base = buildResponsesInput({
+      input: Array.isArray(payload.input) ? payload.input : [],
+      model,
+      supportsCustomTools: supportsResponsesCustomTools(model, provider),
+    });
     base.push({ type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_PROMPT }] });
     body = buildResponsesBody({ payload, model, provider, input: base, tools: [], stream: false });
     url = responsesUrl(provider);

@@ -769,6 +769,85 @@ test("usage: real numbers win, zero input substituted, estimate fallback", async
   expect(nothing).toBeNull();
 });
 
+test("Chat wire removes Responses-only builtins without dropping function tools", async () => {
+  const res = await fetch(base + "/v1/responses", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "test-model",
+      input: [user("tool filtering")],
+      tools: [
+        { type: "web_search", external_web_access: true },
+        { type: "function", name: "shell", parameters: { type: "object" } },
+      ],
+      stream: false,
+    }),
+  });
+  expect(res.status).toBe(200);
+  const data = await res.json();
+  expect(data.output.some((item) => item.type === "function_call")).toBe(true);
+});
+
+test("Responses conversion preserves native tools and flattens only namespaces", async () => {
+  const { flattenToolsForResponses, buildResponsesInput } = await import("../src/convert/request.mjs");
+  const custom = {
+    type: "custom",
+    name: "exec",
+    description: "Run code",
+    format: { type: "text" },
+  };
+  const search = { type: "web_search", external_web_access: true };
+  const mcp = { type: "mcp", server_label: "exa", server_url: "https://example.test/mcp" };
+  const result = flattenToolsForResponses([
+    custom,
+    search,
+    mcp,
+    { type: "namespace", name: "collaboration", tools: [{ name: "spawn_agent", parameters: { type: "object" } }] },
+  ]);
+  expect(result.tools[0]).toEqual(custom);
+  expect(result.tools[1]).toEqual(search);
+  expect(result.tools[2]).toEqual(mcp);
+  expect(result.tools[3].name).toBe("collaboration__spawn_agent");
+  expect(result.names.get("collaboration__spawn_agent")).toEqual({ namespace: "collaboration", name: "spawn_agent" });
+  expect([...result.customNames]).toEqual(["exec"]);
+  const fallback = flattenToolsForResponses([custom], { supportsCustomTools: false });
+  expect(fallback.tools[0].type).toBe("function");
+  expect(fallback.tools[0].parameters.required).toEqual(["content"]);
+
+  const input = buildResponsesInput({
+    model: { inputModalities: ["text", "image"] },
+    input: [
+      { type: "function_call", call_id: "c1", name: "spawn_agent", namespace: "collaboration", arguments: "{}" },
+      { type: "function_call_output", call_id: "c1", output: [{ type: "input_text", text: "done" }] },
+    ],
+  });
+  expect(input[0].name).toBe("collaboration__spawn_agent");
+  expect(input[0].namespace).toBeUndefined();
+  expect(input[1]).toEqual({ type: "function_call_output", call_id: "c1", output: "done" });
+
+  const customReplay = buildResponsesInput({
+    model: { inputModalities: ["text"] },
+    supportsCustomTools: false,
+    input: [
+      { type: "custom_tool_call", call_id: "c2", name: "exec", input: "text(1)" },
+      { type: "custom_tool_call_output", call_id: "c2", output: "ok" },
+    ],
+  });
+  expect(customReplay[0]).toEqual({
+    type: "function_call",
+    call_id: "c2",
+    name: "exec",
+    arguments: JSON.stringify({ content: "text(1)" }),
+  });
+  expect(customReplay[1]).toEqual({ type: "function_call_output", call_id: "c2", output: "ok" });
+});
+
+test("catalog exposes search capability from the declared model capability", async () => {
+  const { modelToCatalogEntry } = await import("../src/catalog.mjs");
+  expect(modelToCatalogEntry({ alias: "chat", supportsSearchTool: false }).supports_search_tool).toBe(false);
+  expect(modelToCatalogEntry({ alias: "responses", supportsSearchTool: true }).supports_search_tool).toBe(true);
+});
+
 test("auth: bad secret is rejected", async () => {
   const res = await fetch(
     "http://127.0.0.1:" + server.port + "/_codextras/wrong/v1/models",

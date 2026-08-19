@@ -1,4 +1,7 @@
+import { appendFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
 import { loadConfig, loadSecret, findModel, providerFor } from "./config.mjs";
+import { LOG_PATH, STATE_DIR } from "./config.mjs";
 import { generateCatalog } from "./catalog.mjs";
 import {
   buildChatBody,
@@ -7,6 +10,7 @@ import {
   isResponsesModel,
   providerHeaders,
   responsesUrl,
+  supportsResponsesCustomTools,
 } from "./adapter.mjs";
 import { buildMessages, buildResponsesInput, flattenTools, flattenToolsForResponses } from "./convert/request.mjs";
 import { ChatStreamConverter, mapToolName } from "./convert/stream.mjs";
@@ -28,8 +32,49 @@ const SSE_HEADERS = {
   Connection: "keep-alive",
 };
 
+function debugLog(obj) {
+  try {
+    mkdirSync(path.dirname(LOG_PATH), { recursive: true });
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...obj }) + "\n";
+    appendFileSync(LOG_PATH, line);
+  } catch {}
+}
+
 function json(data, status) {
   return Response.json(data, { status: status || 200 });
+}
+
+function disabledToolTypes(provider, model) {
+  const out = new Set();
+  const lists = [
+    provider && provider.quirks && provider.quirks.disabledTools,
+    provider && provider.quirks && provider.quirks.disabled_tools,
+    model && model.disabledTools,
+    model && model.disabled_tools,
+  ];
+  for (const list of lists) {
+    if (Array.isArray(list)) for (const name of list) if (typeof name === "string" && name) out.add(name);
+  }
+  return out;
+}
+
+function filterToolsByDisabled(tools, provider, model, isResponses) {
+  const disabled = disabledToolTypes(provider, model);
+  // Chat Completions cannot carry Responses builtins such as web_search.
+  // This is a wire capability rule, not a model-name exception. Responses
+  // keeps the native builtin when the declared model supports it.
+  if (!isResponses) {
+    disabled.add("web_search");
+    disabled.add("web_search_2025_08_26");
+  }
+  if (model && model.supportsSearchTool === false) {
+    disabled.add("web_search");
+    disabled.add("web_search_2025_08_26");
+  }
+  if (disabled.size === 0) return tools;
+  return (Array.isArray(tools) ? tools : []).filter(
+    (tool) => !tool || typeof tool.type !== "string" || !disabled.has(tool.type),
+  );
 }
 
 function apiPathFrom(url, prefix, secret) {
@@ -373,13 +418,22 @@ async function handleTurn(request, payload, apiPath, rawBody) {
   }
   const isResponses = isResponsesModel(model, provider);
   if (isResponses) {
-    const { tools, names, customNames } = flattenToolsForResponses(payload.tools);
-    const input = buildResponsesInput({ input: Array.isArray(payload.input) ? payload.input : [], model });
+    const customTools = supportsResponsesCustomTools(model, provider);
+    const { tools: rawTools, names, customNames } = flattenToolsForResponses(payload.tools, {
+      supportsCustomTools: customTools,
+    });
+    const tools = filterToolsByDisabled(rawTools, provider, model, isResponses);
+    const input = buildResponsesInput({
+      input: Array.isArray(payload.input) ? payload.input : [],
+      model,
+      supportsCustomTools: customTools,
+    });
     const stream = payload.stream !== false;
     const body = buildResponsesBody({ payload, model, provider, input, tools, stream });
     const requestBytes = Buffer.byteLength(JSON.stringify(body), "utf8");
     const url = responsesUrl(provider);
     const headers = providerHeaders(provider);
+    debugLog({ dir: "req", wire: "responses", model: model.alias, upstreamModel: model.upstreamModel, isResponses, url, body: JSON.stringify(body).slice(0, 8000), toolsIn: Array.isArray(payload.tools) ? payload.tools.length : 0, inputIn: Array.isArray(payload.input) ? payload.input.length : 0, inputOut: input.length });
     let res;
     try {
       res = await fetch(url, {
@@ -390,6 +444,7 @@ async function handleTurn(request, payload, apiPath, rawBody) {
       });
     } catch (error) {
       const message = error && error.message ? error.message : String(error);
+      debugLog({ dir: "error", wire: "responses", model: model.alias, message });
       return json({ error: { message } }, 502);
     }
     if (!res.ok) {
@@ -399,10 +454,11 @@ async function handleTurn(request, payload, apiPath, rawBody) {
         const parsed = JSON.parse(text);
         if (parsed && parsed.error && parsed.error.message) message = parsed.error.message;
         else if (parsed && parsed.error) message = JSON.stringify(parsed.error);
-        else if (text) message = text.slice(0, 500);
+        else if (text) message = text.slice(0, 3000);
       } catch {
-        if (text) message = text.slice(0, 500);
+        if (text) message = text.slice(0, 3000);
       }
+      debugLog({ dir: "upstream_error", wire: "responses", model: model.alias, status: res.status, upstreamBody: text.slice(0, 8000), sentBody: JSON.stringify(body).slice(0, 8000) });
       return json({ error: { message } }, res.status);
     }
     if (stream) {
@@ -426,7 +482,8 @@ async function handleTurn(request, payload, apiPath, rawBody) {
     }
     return json(mapped);
   }
-  const { tools, names, customNames } = flattenTools(payload.tools);
+  const { tools: rawTools, names, customNames } = flattenTools(payload.tools);
+  const tools = filterToolsByDisabled(rawTools, provider, model, isResponses);
   const messages = buildMessages({ input: payload.input || [], model });
   if (typeof payload.instructions === "string" && payload.instructions.trim()) {
     messages.unshift({ role: "system", content: payload.instructions });
@@ -436,8 +493,7 @@ async function handleTurn(request, payload, apiPath, rawBody) {
   const requestBytes = Buffer.byteLength(JSON.stringify(body), "utf8");
   const url = chatUrl(provider);
   const headers = providerHeaders(provider);
-  const hasBuiltinTools =
-    Array.isArray(body.tools) && body.tools.some((t) => t && t.type !== "function");
+  debugLog({ dir: "req", wire: "chat", model: model.alias, upstreamModel: model.upstreamModel, isResponses, url, body: JSON.stringify(body).slice(0, 8000), toolsIn: Array.isArray(payload.tools) ? payload.tools.length : 0, inputIn: Array.isArray(payload.input) ? payload.input.length : 0, messagesOut: messages.length });
   let res;
   try {
     res = await fetch(url, {
@@ -446,22 +502,9 @@ async function handleTurn(request, payload, apiPath, rawBody) {
       body: JSON.stringify(body),
       signal: request.signal,
     });
-    if (!res.ok && hasBuiltinTools) {
-      // The upstream may not implement a builtin tool type; retry once
-      // without it so the turn survives instead of dying on a serde error.
-      const text = await res.text().catch(() => "");
-      if (/unknown variant [`'"]?web_search/i.test(text)) {
-        body.tools = body.tools.filter((t) => t && t.type === "function");
-        res = await fetch(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: request.signal,
-        });
-      }
-    }
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
+    debugLog({ dir: "error", wire: "chat", model: model.alias, message });
     return json({ error: { message } }, 502);
   }
   if (!res.ok) {
@@ -470,9 +513,12 @@ async function handleTurn(request, payload, apiPath, rawBody) {
     try {
       const parsed = JSON.parse(text);
       if (parsed && parsed.error && parsed.error.message) message = parsed.error.message;
+      else if (parsed && parsed.error) message = JSON.stringify(parsed.error).slice(0, 3000);
+      else if (text) message = text.slice(0, 3000);
     } catch {
-      // Keep the generic message when the body is not JSON.
+      if (text) message = text.slice(0, 3000);
     }
+    debugLog({ dir: "upstream_error", wire: "chat", model: model.alias, status: res.status, upstreamBody: text.slice(0, 8000), sentBody: JSON.stringify(body).slice(0, 8000) });
     return json({ error: { message } }, res.status);
   }
   if (stream) {

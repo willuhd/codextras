@@ -54,8 +54,10 @@ export function modelToCatalogEntry(model) {
     default_verbosity: null,
     default_reasoning_summary: reasoningSummary,
     supports_reasoning_summaries: supportsSummaries,
-    supports_search_tool: false,
-    experimental_supported_tools: [],
+    supports_search_tool: model.supportsSearchTool === true,
+    experimental_supported_tools: Array.isArray(model.experimentalSupportedTools)
+      ? model.experimentalSupportedTools
+      : [],
     additional_speed_tiers: [],
     service_tiers: [],
     comp_hash: model.alias + "-v1",

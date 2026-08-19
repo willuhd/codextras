@@ -114,23 +114,71 @@ export function flattenTools(tools) {
   return { tools: flat, names, customNames: extractCustomToolNames(tools) };
 }
 
-// Responses API shape is flat: {type:"function", name, description, parameters}
-// rather than chat's {type:"function", function:{name,…}}. Namespace tools are
-// still flattened to collaboration__spawn_agent etc., and custom tools keep the
-// single required `content` schema so the custom_tool_call bridge stays shared.
-export function flattenToolsForResponses(tools) {
-  const { tools: chatTools, names, customNames } = flattenTools(tools);
-  const flat = chatTools.map((t) => {
-    if (t && t.type === "function" && t.function && typeof t.function.name === "string") {
-      return {
-        type: "function",
-        name: t.function.name,
-        description: t.function.description || "",
-        parameters: t.function.parameters || { type: "object", properties: {} },
-      };
+// Responses tools are already native flat objects. Preserve every native
+// definition (custom, MCP, web_search, computer, and future builtins) instead
+// of converting it into a synthetic function. The only structural conversion
+// is Codex namespace tools, because Responses has no namespace wrapper.
+function customToolAsFunction(tool) {
+  return {
+    type: "function",
+    name: tool.name,
+    description: tool.description || "",
+    parameters:
+      tool.parameters || {
+        type: "object",
+        properties: {
+          content: {
+            type: "string",
+            description: "The " + tool.name + " content following the specified format",
+          },
+        },
+        required: ["content"],
+      },
+  };
+}
+
+export function flattenToolsForResponses(tools, { supportsCustomTools = true } = {}) {
+  const flat = [];
+  const names = new Map();
+  const customNames = extractCustomToolNames(tools);
+  if (!Array.isArray(tools)) return { tools: flat, names, customNames };
+
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object" || typeof tool.type !== "string") continue;
+    if (tool.type === "namespace" && typeof tool.name === "string") {
+      for (const fn of Array.isArray(tool.tools) ? tool.tools : []) {
+        if (!fn || typeof fn.name !== "string") continue;
+        const flatName = flatNamespaceName(tool.name, fn.name);
+        flat.push({
+          type: "function",
+          name: flatName,
+          description: fn.description || "",
+          parameters: fn.parameters || { type: "object", properties: {} },
+          ...(fn.strict === undefined ? {} : { strict: fn.strict }),
+        });
+        names.set(flatName, { namespace: tool.name, name: fn.name });
+      }
+      continue;
     }
-    return t;
-  });
+    if (tool.type === "custom" && !supportsCustomTools) {
+      flat.push(customToolAsFunction(tool));
+      continue;
+    }
+    if (tool.type === "function" && tool.function && typeof tool.function.name === "string") {
+      const converted = {
+        ...tool,
+        name: tool.function.name,
+        description: tool.function.description || "",
+        parameters: tool.function.parameters || { type: "object", properties: {} },
+      };
+      delete converted.function;
+      flat.push(converted);
+      continue;
+    }
+    // Function, custom, MCP, web search, and other Responses-native tools are
+    // passed through unchanged when the provider advertises that wire type.
+    flat.push(tool);
+  }
   return { tools: flat, names, customNames };
 }
 
@@ -470,10 +518,13 @@ export function userMessageTexts(input) {
 // not valid for a raw upstream Responses call (Meta/Go validates strictly:
 // `input[12] did not match any supported type`). This mirrors buildMessages
 // but emits valid Responses items instead of Chat messages.
-function partToResponses(part, model) {
+// assistant messages must use output_text, user/system/developer use input_text
+// (Meta validates: `input_text is not valid on assistant messages`).
+function partToResponses(part, model, role) {
   if (!part || typeof part !== "object") return undefined;
+  const isAssistant = role === "assistant";
   if (part.type === "input_text" || part.type === "output_text") {
-    if (typeof part.text === "string") return { type: "input_text", text: part.text };
+    if (typeof part.text === "string") return { type: isAssistant ? "output_text" : "input_text", text: part.text };
     return undefined;
   }
   if (part.type === "input_image") {
@@ -485,7 +536,7 @@ function partToResponses(part, model) {
   }
   if (part.type === "encrypted_content") {
     const v = part.encrypted_content;
-    if (typeof v === "string" && !isOpaqueToken(v)) return { type: "input_text", text: v };
+    if (typeof v === "string" && !isOpaqueToken(v)) return { type: isAssistant ? "output_text" : "input_text", text: v };
     return undefined;
   }
   // Already Responses-shaped image_url form
@@ -497,9 +548,10 @@ function partToResponses(part, model) {
 }
 
 function contentToResponses(item, model) {
+  const role = item.role;
   const parts = [];
   for (const part of Array.isArray(item.content) ? item.content : []) {
-    const conv = partToResponses(part, model);
+    const conv = partToResponses(part, model, role);
     if (conv) parts.push(conv);
   }
   // Keep Codex's <image path> tag as text when bytes are dropped — it is
@@ -507,7 +559,7 @@ function contentToResponses(item, model) {
   return parts;
 }
 
-export function buildResponsesInput({ input, model }) {
+export function buildResponsesInput({ input, model, supportsCustomTools = true }) {
   const out = [];
   const seenOutputs = new Set();
   const items = Array.isArray(input) ? input : [];
@@ -537,9 +589,19 @@ export function buildResponsesInput({ input, model }) {
       continue;
     }
     if (item.type === "function_call" || item.type === "custom_tool_call") {
-      // Forward as-is; upstream expects flat name (collaboration__spawn_agent) which
-      // we forward via buildResponsesBody tools mapping, and response mapping handles return.
-      out.push(item);
+      // Responses has no namespace wrapper: replay namespaced Codex calls with
+      // the same flat name used in the native tool definition.
+      const call = { ...item };
+      if (typeof call.namespace === "string" && typeof call.name === "string" && !call.name.includes(COLLABORATION_TOOL_DELIMITER)) {
+        call.name = flatNamespaceName(call.namespace, call.name);
+        delete call.namespace;
+      }
+      if (!supportsCustomTools && call.type === "custom_tool_call") {
+        call.type = "function_call";
+        call.arguments = JSON.stringify({ content: typeof call.input === "string" ? call.input : "" });
+        delete call.input;
+      }
+      out.push(call);
       continue;
     }
     if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
@@ -547,15 +609,24 @@ export function buildResponsesInput({ input, model }) {
       if (!callId || seenOutputs.has(callId)) continue;
       seenOutputs.add(callId);
       let output = item.output;
-      // Drop image bytes for text-only models (same marker as chat)
       if (Array.isArray(output)) {
         const filtered = dropToolOutputImages(output, model);
-        // dropToolOutputImages uses input_image || image_url check, which covers Responses parts too
         output = filtered;
+        // Responses expects output as string, like Chat's tool message content.
+        // Stringify array to preserve text, matching buildMessages behavior.
+        if (Array.isArray(output)) {
+          if (output.length === 0) output = "";
+          else if (output.every((p) => p && typeof p.text === "string")) output = output.map((p) => p.text).join("\n");
+          else output = JSON.stringify(output);
+        }
       }
       if (output && typeof output === "object" && !Array.isArray(output)) output = JSON.stringify(output);
-      if (typeof output !== "string" && !Array.isArray(output)) output = String(output ?? "");
-      out.push({ type: item.type, call_id: callId, output });
+      if (typeof output !== "string") output = String(output ?? "");
+      out.push({
+        type: !supportsCustomTools && item.type === "custom_tool_call_output" ? "function_call_output" : item.type,
+        call_id: callId,
+        output,
+      });
       continue;
     }
     if (item.type === "message") {
@@ -564,7 +635,10 @@ export function buildResponsesInput({ input, model }) {
       if (!parts.length) {
         // Keep at least the text if message was only an image tag that got stripped but original had <image ...> text
         const rawText = Array.isArray(item.content) ? item.content.map((p) => (p && typeof p.text === "string" ? p.text : "")).join("").trim() : "";
-        if (rawText) out.push({ type: "message", role, content: [{ type: "input_text", text: rawText }] });
+        if (rawText) {
+          const t = role === "assistant" ? "output_text" : "input_text";
+          out.push({ type: "message", role, content: [{ type: t, text: rawText }] });
+        }
         continue;
       }
       out.push({ type: "message", role, content: parts });
