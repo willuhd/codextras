@@ -7,7 +7,7 @@ import {
   sse,
   sseDone,
 } from "./util.mjs";
-import { buildMessages, userMessageTexts } from "./convert/request.mjs";
+import { buildMessages, buildResponsesInput, userMessageTexts } from "./convert/request.mjs";
 import {
   buildChatBody,
   buildResponsesBody,
@@ -38,9 +38,9 @@ export async function summarize({ payload, model, provider, requestBytes, signal
   let body;
   let url;
   if (isResponses) {
-    const input = Array.isArray(payload.input) ? [...payload.input] : [];
-    input.push({ type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_PROMPT }] });
-    body = buildResponsesBody({ payload, model, provider, input, tools: [], stream: false });
+    const base = buildResponsesInput({ input: Array.isArray(payload.input) ? payload.input : [], model });
+    base.push({ type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_PROMPT }] });
+    body = buildResponsesBody({ payload, model, provider, input: base, tools: [], stream: false });
     url = responsesUrl(provider);
   } else {
     const messages = buildMessages({ input: payload.input || [], model });

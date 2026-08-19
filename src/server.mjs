@@ -8,7 +8,7 @@ import {
   providerHeaders,
   responsesUrl,
 } from "./adapter.mjs";
-import { buildMessages, flattenTools, flattenToolsForResponses } from "./convert/request.mjs";
+import { buildMessages, buildResponsesInput, flattenTools, flattenToolsForResponses } from "./convert/request.mjs";
 import { ChatStreamConverter, mapToolName } from "./convert/stream.mjs";
 import { convertChatJsonToResponses } from "./convert/json.mjs";
 import { toolCallItem, unwrapCustomToolArguments } from "./convert/tools.mjs";
@@ -374,7 +374,7 @@ async function handleTurn(request, payload, apiPath, rawBody) {
   const isResponses = isResponsesModel(model, provider);
   if (isResponses) {
     const { tools, names, customNames } = flattenToolsForResponses(payload.tools);
-    const input = Array.isArray(payload.input) ? payload.input : [];
+    const input = buildResponsesInput({ input: Array.isArray(payload.input) ? payload.input : [], model });
     const stream = payload.stream !== false;
     const body = buildResponsesBody({ payload, model, provider, input, tools, stream });
     const requestBytes = Buffer.byteLength(JSON.stringify(body), "utf8");

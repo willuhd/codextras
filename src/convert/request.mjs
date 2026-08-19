@@ -464,3 +464,130 @@ export function userMessageTexts(input) {
   }
   return texts;
 }
+
+// Responses input normalizer: Codex sends an enriched Responses journal
+// (agent_message, compaction, reasoning with encrypted blobs, etc.) that is
+// not valid for a raw upstream Responses call (Meta/Go validates strictly:
+// `input[12] did not match any supported type`). This mirrors buildMessages
+// but emits valid Responses items instead of Chat messages.
+function partToResponses(part, model) {
+  if (!part || typeof part !== "object") return undefined;
+  if (part.type === "input_text" || part.type === "output_text") {
+    if (typeof part.text === "string") return { type: "input_text", text: part.text };
+    return undefined;
+  }
+  if (part.type === "input_image") {
+    const url = part.image_url;
+    if (typeof url === "string" && url && modelPassthroughImages(model)) {
+      return { type: "input_image", image_url: url };
+    }
+    return undefined;
+  }
+  if (part.type === "encrypted_content") {
+    const v = part.encrypted_content;
+    if (typeof v === "string" && !isOpaqueToken(v)) return { type: "input_text", text: v };
+    return undefined;
+  }
+  // Already Responses-shaped image_url form
+  if (part.type === "image_url" && part.image_url && typeof part.image_url.url === "string") {
+    if (modelPassthroughImages(model)) return { type: "input_image", image_url: part.image_url.url };
+    return undefined;
+  }
+  return undefined;
+}
+
+function contentToResponses(item, model) {
+  const parts = [];
+  for (const part of Array.isArray(item.content) ? item.content : []) {
+    const conv = partToResponses(part, model);
+    if (conv) parts.push(conv);
+  }
+  // Keep Codex's <image path> tag as text when bytes are dropped — it is
+  // already an input_text part in the message, so the above preserves it.
+  return parts;
+}
+
+export function buildResponsesInput({ input, model }) {
+  const out = [];
+  const seenOutputs = new Set();
+  const items = Array.isArray(input) ? input : [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "reasoning") {
+      // Preserve encrypted reasoning verbatim for Muse (store:false + include)
+      const hasSummary = Array.isArray(item.summary) || typeof item.summary === "string";
+      const hasEncrypted = typeof item.encrypted_content === "string" && item.encrypted_content.length > 0;
+      if (!hasSummary && !hasEncrypted) {
+        const text = reasoningItemText(item);
+        if (!text) continue;
+        out.push({ type: "reasoning", id: item.id || undefined, summary: [{ type: "summary_text", text }] });
+      } else {
+        const r = { type: "reasoning" };
+        if (item.id) r.id = item.id;
+        if (Array.isArray(item.summary)) r.summary = item.summary;
+        else if (typeof item.summary === "string") r.summary = [{ type: "summary_text", text: item.summary }];
+        if (typeof item.encrypted_content === "string") r.encrypted_content = item.encrypted_content;
+        // Content fallback
+        if (!r.summary && item.content) {
+          const t = reasoningItemText(item);
+          if (t) r.summary = [{ type: "summary_text", text: t }];
+        }
+        out.push(r);
+      }
+      continue;
+    }
+    if (item.type === "function_call" || item.type === "custom_tool_call") {
+      // Forward as-is; upstream expects flat name (collaboration__spawn_agent) which
+      // we forward via buildResponsesBody tools mapping, and response mapping handles return.
+      out.push(item);
+      continue;
+    }
+    if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+      const callId = item.call_id || item.id;
+      if (!callId || seenOutputs.has(callId)) continue;
+      seenOutputs.add(callId);
+      let output = item.output;
+      // Drop image bytes for text-only models (same marker as chat)
+      if (Array.isArray(output)) {
+        const filtered = dropToolOutputImages(output, model);
+        // dropToolOutputImages uses input_image || image_url check, which covers Responses parts too
+        output = filtered;
+      }
+      if (output && typeof output === "object" && !Array.isArray(output)) output = JSON.stringify(output);
+      if (typeof output !== "string" && !Array.isArray(output)) output = String(output ?? "");
+      out.push({ type: item.type, call_id: callId, output });
+      continue;
+    }
+    if (item.type === "message") {
+      const role = item.role === "developer" || item.role === "system" || item.role === "assistant" ? item.role : "user";
+      const parts = contentToResponses(item, model);
+      if (!parts.length) {
+        // Keep at least the text if message was only an image tag that got stripped but original had <image ...> text
+        const rawText = Array.isArray(item.content) ? item.content.map((p) => (p && typeof p.text === "string" ? p.text : "")).join("").trim() : "";
+        if (rawText) out.push({ type: "message", role, content: [{ type: "input_text", text: rawText }] });
+        continue;
+      }
+      out.push({ type: "message", role, content: parts });
+      continue;
+    }
+    if (item.type === "agent_message") {
+      const text = agentMessageText(item);
+      if (text) out.push({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+      continue;
+    }
+    if (item.type === "compaction" || item.type === "context_compaction") {
+      const summary = decodeSummary(item.encrypted_content);
+      const text = summary ? SUMMARY_PREFIX + "\n\n" + summary : "Earlier conversation history was compacted in an unreadable format.";
+      out.push({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+      continue;
+    }
+    // Valid Responses passthrough types that Go/Meta accept verbatim
+    if (item.type === "web_search_call" || item.type === "reasoning" || item.type === "input_text" || item.type === "input_image") {
+      out.push(item);
+      continue;
+    }
+    // Drop unknown Codex-specific types (e.g. compaction_trigger is handled upstream as control)
+    if (item.type === "compaction_trigger") continue;
+  }
+  return out;
+}
