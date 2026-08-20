@@ -171,13 +171,46 @@ async function streamTurn(upstream, { model, requestBytes, toolNames, customName
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
+function normalizeArgsForCodex(value) {
+  if (value === undefined || value === null) return "{}";
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return "{}";
+    try {
+      JSON.parse(trimmed);
+      return trimmed;
+    } catch {
+      return "{}";
+    }
+  }
+  if (typeof value === "object") {
+    try {
+      const s = JSON.stringify(value);
+      if (s) {
+        JSON.parse(s);
+        return s;
+      }
+    } catch {}
+    return "{}";
+  }
+  return "{}";
+}
+
 function mapResponsesItemForCodex(item, toolNames, customNames) {
   if (!item || typeof item !== "object") return item;
   const t = item.type;
   if (t !== "function_call" && t !== "custom_tool_call") return item;
   let name = item.name;
   let callId = item.call_id || item.id;
-  let args = typeof item.arguments === "string" ? item.arguments : typeof item.input === "string" ? item.input : "";
+  let rawArgs = item.arguments;
+  if (typeof rawArgs !== "string" && rawArgs !== undefined && rawArgs !== null && typeof rawArgs === "object") {
+    try {
+      rawArgs = JSON.stringify(rawArgs);
+    } catch {
+      rawArgs = "";
+    }
+  }
+  let args = typeof rawArgs === "string" ? rawArgs : typeof item.input === "string" ? item.input : "";
   // If upstream returned flat name (collaboration__spawn_agent), map to namespaced for Codex
   const mapped = toolNames instanceof Map ? toolNames.get(name) : undefined;
   const fallback = !mapped ? mapToolName(name) : undefined;
@@ -201,13 +234,33 @@ function mapResponsesItemForCodex(item, toolNames, customNames) {
   }
   if (t === "custom_tool_call" && !isCustom) {
     // Upstream mistakenly returned custom for a non-custom tool — normalize to function_call
+    let normalized;
+    if (typeof item.input === "string") {
+      const trimmed = item.input.trim();
+      if (!trimmed) normalized = "{}";
+      else {
+        try {
+          JSON.parse(trimmed);
+          normalized = trimmed;
+        } catch {
+          normalized = JSON.stringify({ content: item.input });
+          try {
+            JSON.parse(normalized);
+          } catch {
+            normalized = "{}";
+          }
+        }
+      }
+    } else {
+      normalized = normalizeArgsForCodex(args);
+    }
     return {
       id: callId,
       type: "function_call",
       status: item.status || "completed",
       call_id: callId,
       name,
-      arguments: typeof item.input === "string" ? item.input : args,
+      arguments: normalized,
       ...(item.namespace ? { namespace: item.namespace } : target ? { namespace: target.namespace } : {}),
     };
   }
@@ -216,7 +269,7 @@ function mapResponsesItemForCodex(item, toolNames, customNames) {
   return {
     ...item,
     name,
-    arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}),
+    arguments: normalizeArgsForCodex(args),
     ...(target && !item.namespace ? { namespace: target.namespace } : {}),
   };
 }

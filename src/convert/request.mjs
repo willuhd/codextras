@@ -36,6 +36,34 @@ export function splitFlatCollaborationName(name) {
   return toolName ? toolName : undefined;
 }
 
+// Responses / Chat both require function `arguments` to be a valid JSON string.
+// Console Go's Responses endpoint validates strictly (`arguments` must be valid JSON)
+// while Chat is lenient; normalize here so replays never forward `""` / object / invalid.
+function normalizeFunctionArguments(value) {
+  if (value === undefined || value === null) return "{}";
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return "{}";
+    try {
+      JSON.parse(trimmed);
+      return trimmed;
+    } catch {
+      return "{}";
+    }
+  }
+  if (typeof value === "object") {
+    try {
+      const stringified = JSON.stringify(value);
+      if (typeof stringified === "string" && stringified) {
+        JSON.parse(stringified);
+        return stringified;
+      }
+    } catch {}
+    return "{}";
+  }
+  return "{}";
+}
+
 const CHAT_BUILTIN_TOOLS = new Set(["web_search", "web_search_2025_08_26"]);
 
 // Flatten the tools the app sends into chat-completions shape. The conversion
@@ -355,10 +383,8 @@ export function buildMessages({ input, model }) {
       // custom_tool_call items carry the raw payload in `input`; reconstruct
       // the chat arguments shape the upstream produced (content schema).
       args = JSON.stringify({ content: item.input });
-    } else if (typeof item.arguments === "string") {
-      args = item.arguments;
     } else {
-      args = JSON.stringify(item.arguments ?? {});
+      args = normalizeFunctionArguments(item.arguments);
     }
     const last = messages[messages.length - 1];
     if (last && last.role === "assistant") {
@@ -600,6 +626,8 @@ export function buildResponsesInput({ input, model, supportsCustomTools = true }
         call.type = "function_call";
         call.arguments = JSON.stringify({ content: typeof call.input === "string" ? call.input : "" });
         delete call.input;
+      } else if (call.type === "function_call") {
+        call.arguments = normalizeFunctionArguments(call.arguments);
       }
       out.push(call);
       continue;

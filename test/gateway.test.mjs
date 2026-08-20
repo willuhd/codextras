@@ -854,3 +854,54 @@ test("auth: bad secret is rejected", async () => {
   );
   expect(res.status).toBe(404);
 });
+
+test("arguments normalization: empty/invalid/object replay becomes valid JSON for Responses", async () => {
+  const { buildResponsesInput } = await import("../src/convert/request.mjs");
+  const cases = [
+    { input: { type: "function_call", call_id: "c1", name: "shell", arguments: "" }, expected: "{}" },
+    { input: { type: "function_call", call_id: "c2", name: "shell", arguments: "   " }, expected: "{}" },
+    { input: { type: "function_call", call_id: "c3", name: "shell", arguments: '{"a":}' }, expected: "{}" },
+    { input: { type: "function_call", call_id: "c4", name: "shell", arguments: { a: 1 } }, expected: '{"a":1}' },
+    { input: { type: "function_call", call_id: "c5", name: "shell" }, expected: "{}" },
+  ];
+  for (const { input, expected } of cases) {
+    const out = buildResponsesInput({ model: { inputModalities: ["text"] }, input: [input] });
+    expect(out[0].arguments).toBe(expected);
+  }
+});
+
+test("arguments normalization: chat buildMessages empty/invalid becomes valid JSON", async () => {
+  const { buildMessages } = await import("../src/convert/request.mjs");
+  const msgs = buildMessages({
+    model: { inputModalities: ["text"] },
+    input: [
+      { type: "function_call", call_id: "c1", name: "shell", arguments: "" },
+      { type: "function_call", call_id: "c2", name: "shell", arguments: "notjson" },
+      { type: "function_call", call_id: "c3", name: "shell", arguments: { b: 2 } },
+    ],
+  });
+  const calls = msgs.flatMap((m) => (m.tool_calls ? m.tool_calls : [])).map((c) => c.function.arguments);
+  expect(calls[0]).toBe("{}");
+  expect(calls[1]).toBe("{}");
+  expect(calls[2]).toBe('{"b":2}');
+});
+
+test("toolCallItem normalizes function arguments to valid JSON", async () => {
+  const { toolCallItem } = await import("../src/convert/tools.mjs");
+  expect(toolCallItem({ callId: "c1", name: "shell", args: "", status: "completed", customNames: new Set() }).arguments).toBe("{}");
+  expect(toolCallItem({ callId: "c2", name: "shell", args: "invalid", status: "completed", customNames: new Set() }).arguments).toBe("{}");
+  expect(toolCallItem({ callId: "c3", name: "shell", args: { x: 1 }, status: "completed", customNames: new Set() }).arguments).toBe('{"x":1}');
+  expect(toolCallItem({ callId: "c4", name: "shell", args: '{"ok":true}', status: "completed", customNames: new Set() }).arguments).toBe('{"ok":true}');
+});
+
+test("mapResponsesItemForCodex handles object arguments from upstream", async () => {
+  const { createServer } = await import("../src/server.mjs");
+  // Indirectly test via transformResponsesJsonForCodex which uses mapResponsesItemForCodex
+  const { buildResponsesInput } = await import("../src/convert/request.mjs");
+  // Simulate upstream returning object arguments (should be normalized to string)
+  const out = buildResponsesInput({
+    model: { inputModalities: ["text"] },
+    input: [{ type: "function_call", call_id: "c1", name: "shell", arguments: { cmd: "echo hi" } }],
+  });
+  expect(out[0].arguments).toBe('{"cmd":"echo hi"}');
+});

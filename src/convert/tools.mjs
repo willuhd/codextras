@@ -38,6 +38,31 @@ export function unwrapCustomToolArguments(argumentsString) {
   return argumentsString;
 }
 
+function normalizeToolArguments(args) {
+  if (args === undefined || args === null) return "{}";
+  if (typeof args === "string") {
+    const trimmed = args.trim();
+    if (!trimmed) return "{}";
+    try {
+      JSON.parse(trimmed);
+      return trimmed;
+    } catch {
+      return "{}";
+    }
+  }
+  if (typeof args === "object") {
+    try {
+      const s = JSON.stringify(args);
+      if (s) {
+        JSON.parse(s);
+        return s;
+      }
+    } catch {}
+    return "{}";
+  }
+  return "{}";
+}
+
 export function toolCallItem({ callId, name, args, status, customNames }) {
   const custom = customNames instanceof Set && customNames.has(name);
   const item = {
@@ -50,7 +75,7 @@ export function toolCallItem({ callId, name, args, status, customNames }) {
   if (custom) {
     item.input = status === "completed" ? unwrapCustomToolArguments(args) : "";
   } else {
-    item.arguments = args;
+    item.arguments = normalizeToolArguments(args);
   }
   return item;
 }
